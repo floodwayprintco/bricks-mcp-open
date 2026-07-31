@@ -346,9 +346,16 @@ function autofix(content, options = {}) {
   }
 
   // === Pass 1: Strip bare px values ===
-  for (const el of content) {
-    if (el && el.settings && typeof el.settings === 'object') {
-      el.settings = stripPxValues(el.settings, '', log, el.id || '?');
+  // Skipped on 'preserve' — Floodway divergence from upstream v1.2.4 (2026-07-31).
+  // PX_SAFE_KEYS does not cover nested keys like icon.height, so a preserve save of
+  // human-authored content rewrote "20px" → "20". Bricks itself writes "20px" there
+  // (every icon in the Header Test template stores it that way), so the strip is a
+  // deviation, not a fix. Generated content still gets normalized.
+  if (mode === 'normalize') {
+    for (const el of content) {
+      if (el && el.settings && typeof el.settings === 'object') {
+        el.settings = stripPxValues(el.settings, '', log, el.id || '?');
+      }
     }
   }
 
@@ -518,13 +525,23 @@ function autofix(content, options = {}) {
     }
 
     // Apply builtin fixes (only when condition is met)
-    for (const [key, fix] of Object.entries(BUILTIN_CSS_FIXES)) {
-      const [elType] = key.split(':');
-      if (el.name !== elType) continue;
-      // Skip if condition not met
-      if (fix.when && !fix.when(el, content)) continue;
-      if (fix.css) applyCssFix(el, fix.css, log);
-      if (fix.classes) applyClassFix(el, fix.classes, log);
+    //
+    // OFF BY DEFAULT — Floodway divergence from upstream v1.2.4 (2026-07-31).
+    // These mutate content the caller never asked for: they inject global classes
+    // (ds-section-md, ds-gap-md) that may not exist on the target site, and
+    // !important CSS. The result is reported as "Auto-fixed N issue(s)", which reads
+    // like a favour, so the pollution went unnoticed until it turned up on the live
+    // homepage. A write to a live storefront must be exactly what was sent.
+    // Set BRICKS_MCP_BUILTIN_FIXES=1 to restore upstream behaviour.
+    if (process.env.BRICKS_MCP_BUILTIN_FIXES === '1') {
+      for (const [key, fix] of Object.entries(BUILTIN_CSS_FIXES)) {
+        const [elType] = key.split(':');
+        if (el.name !== elType) continue;
+        // Skip if condition not met
+        if (fix.when && !fix.when(el, content)) continue;
+        if (fix.css) applyCssFix(el, fix.css, log);
+        if (fix.classes) applyClassFix(el, fix.classes, log);
+      }
     }
   }
 
