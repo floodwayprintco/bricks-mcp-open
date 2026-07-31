@@ -346,9 +346,16 @@ function autofix(content, options = {}) {
   }
 
   // === Pass 1: Strip bare px values ===
-  for (const el of content) {
-    if (el && el.settings && typeof el.settings === 'object') {
-      el.settings = stripPxValues(el.settings, '', log, el.id || '?');
+  // Normalize only. PX_SAFE_KEYS does not cover nested keys such as icon.height, so
+  // on a preserve save this rewrote human-authored "20px" to "20". Bricks itself
+  // writes "20px" there — every icon in a stock header template stores it that way —
+  // so on existing content the strip is a deviation rather than a fix. Content the
+  // tool generates is still normalized.
+  if (mode === 'normalize') {
+    for (const el of content) {
+      if (el && el.settings && typeof el.settings === 'object') {
+        el.settings = stripPxValues(el.settings, '', log, el.id || '?');
+      }
     }
   }
 
@@ -517,14 +524,27 @@ function autofix(content, options = {}) {
       }
     }
 
-    // Apply builtin fixes (only when condition is met)
-    for (const [key, fix] of Object.entries(BUILTIN_CSS_FIXES)) {
-      const [elType] = key.split(':');
-      if (el.name !== elType) continue;
-      // Skip if condition not met
-      if (fix.when && !fix.when(el, content)) continue;
-      if (fix.css) applyCssFix(el, fix.css, log);
-      if (fix.classes) applyClassFix(el, fix.classes, log);
+    // Apply builtin fixes (only when condition is met).
+    //
+    // Opt-in, via BRICKS_MCP_BUILTIN_FIXES=1.
+    //
+    // These inject design-system global classes (ds-section-md, ds-gap-md) that may
+    // not exist on the target site, plus !important CSS. They are a good default for
+    // a site built with that design system and wrong for every other site: the result
+    // is reported only as "Auto-fixed N issue(s)", which reads like a courtesy, so
+    // classes that resolve to nothing land on a page and nobody notices until they
+    // show up in the browser. A write to a live site should be what the caller sent.
+    //
+    // Flagged rather than deleted so the behaviour is one env var away.
+    if (process.env.BRICKS_MCP_BUILTIN_FIXES === '1') {
+      for (const [key, fix] of Object.entries(BUILTIN_CSS_FIXES)) {
+        const [elType] = key.split(':');
+        if (el.name !== elType) continue;
+        // Skip if condition not met
+        if (fix.when && !fix.when(el, content)) continue;
+        if (fix.css) applyCssFix(el, fix.css, log);
+        if (fix.classes) applyClassFix(el, fix.classes, log);
+      }
     }
   }
 
