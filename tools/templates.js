@@ -184,8 +184,16 @@ const templateTools = [
         let fixResult = null;
         let validation = null;
         if (content && Array.isArray(content)) {
-          // Auto-fix common issues before validation
-          fixResult = autofix(content);
+          // Auto-fix common issues before validation.
+          //
+          // mode:'preserve' — Floodway divergence from upstream v1.2.4 (2026-07-31).
+          // Upstream passes no mode here, so it defaults to 'normalize', which runs Pass 5
+          // and silently rewrites el.name 'block' → 'container' on any element carrying a
+          // flex property. That is a structural change to existing content nobody asked for.
+          // Upstream already fixed exactly this for pages in 06d34cd ("non-destructive saves
+          // of existing content", tools/pages.js:155) and missed the template writer.
+          // Observed on template 306234: three blocks silently promoted to containers.
+          fixResult = autofix(content, { mode: 'preserve' });
           const fixedContent = fixResult.content;
 
           validation = validateContent(fixedContent);
