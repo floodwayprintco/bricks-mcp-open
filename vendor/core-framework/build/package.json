@@ -1,0 +1,22 @@
+{
+  "name": "cf-compiler-bundle",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "chroma-js": "^3.2.0",
+    "colord": "^2.9.3",
+    "compare-versions": "^6.1.0",
+    "easing-coordinates": "^2.0.2",
+    "lz-string": "^1.5.0",
+    "postcss": "^8.5.26",
+    "postcss-preset-env": "^10.6.1",
+    "postcss-selector-parser": "^7.1.5",
+    "process": "^0.11.10",
+    "ts-pattern": "^4.3.0",
+    "ulid": "^2.3.0",
+    "zod": "^3.21.4"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
