@@ -502,18 +502,19 @@ const coreFrameworkTools = [
   {
     name: 'cf_diff_preset',
     description:
-      'Diff the live Core Framework preset against a saved snapshot, or two snapshots against each other. ' +
-      'Reports changed token paths with before/after values. Call with no arguments to list available snapshots.',
+      'Diff two Core Framework preset states and report changed token paths as baseline → compare. ' +
+      'Give a baseline snapshot and it diffs against the live preset; give both and it diffs snapshot to snapshot. ' +
+      'Call with no arguments to list available snapshots.',
     inputSchema: {
       type: 'object',
       properties: {
-        against: {
+        baseline: {
           type: 'string',
-          description: 'Snapshot filename to compare against. Omit to list what is available.',
+          description: 'Snapshot filename for the BEFORE state. Omit to list what is available.',
         },
-        from: {
+        compare: {
           type: 'string',
-          description: 'Optional second snapshot filename. When set, compares from → against instead of live → against.',
+          description: 'Snapshot filename for the AFTER state. Defaults to the live preset when omitted.',
         },
         limit: {
           type: 'number',
@@ -524,10 +525,16 @@ const coreFrameworkTools = [
     },
     handler: async (args = {}) => {
       try {
-        const { against, from, limit = 100 } = args;
+        // `against`/`from` were the original names and read backwards: `from` was the
+        // AFTER side despite the description claiming "from → against". That got the
+        // direction wrong on the tool's first real use. Accepted as aliases so an old
+        // call still diffs the way it used to rather than silently reversing.
+        const baselineName = args.baseline ?? args.against;
+        const compareName = args.compare ?? args.from;
+        const limit = args.limit ?? 100;
         const siteKey = getActiveSiteKey();
 
-        if (!against) {
+        if (!baselineName) {
           const available = listSnapshots();
           if (!available.length) {
             return { content: [{ type: 'text', text: `No Core Framework snapshots for site "${siteKey}" yet. Take one with cf_snapshot_preset.` }] };
@@ -535,40 +542,42 @@ const coreFrameworkTools = [
           return {
             content: [{
               type: 'text',
-              text: `Snapshots for "${siteKey}" (newest first):\n\n  ${available.join('\n  ')}\n\nDiff with cf_diff_preset { against: "<filename>" }.`,
+              text:
+                `Snapshots for "${siteKey}" (newest first):\n\n  ${available.join('\n  ')}\n\n` +
+                `Diff the live preset against one:      cf_diff_preset { baseline: "<older>" }\n` +
+                `Diff two snapshots (oldest first):     cf_diff_preset { baseline: "<older>", compare: "<newer>" }`,
             }],
           };
         }
 
-        const baseline = readSnapshot(against);
-        let current, currentLabel;
-        if (from) {
-          current = readSnapshot(from);
-          currentLabel = from;
-        } else {
-          current = (await cfGet('/preset')).data;
-          currentLabel = 'live';
-        }
+        const baselineData = readSnapshot(baselineName);
+        const compareData = compareName ? readSnapshot(compareName) : (await cfGet('/preset')).data;
+        const compareLabel = compareName || 'live';
 
-        const changes = diffValues(baseline, current, '', [], Math.max(1, limit));
+        const changes = diffValues(baselineData, compareData, '', [], Math.max(1, limit));
 
         if (!changes.length) {
-          return { content: [{ type: 'text', text: `No differences: ${currentLabel} matches ${against} exactly.` }] };
+          return { content: [{ type: 'text', text: `No differences: ${compareLabel} matches ${baselineName} exactly.` }] };
         }
 
         const truncated = changes.length >= limit;
         const rendered = changes.slice(0, limit).map(c => {
-          const before = JSON.stringify(c.before);
-          const after = JSON.stringify(c.after);
-          const clip = (s) => (s === undefined ? '(absent)' : s.length > 120 ? s.slice(0, 117) + '...' : s);
-          return `  ${c.path}\n      ${clip(before)}  →  ${clip(after)}`;
+          const clip = (v) => {
+            if (v === undefined) return '(absent)';
+            const s = JSON.stringify(v);
+            return s.length > 120 ? s.slice(0, 117) + '...' : s;
+          };
+          return `  ${c.path}\n      ${clip(c.before)}  →  ${clip(c.after)}`;
         }).join('\n');
 
         return {
           content: [{
             type: 'text',
             text:
-              `${changes.length}${truncated ? '+' : ''} change(s), ${against} → ${currentLabel}\n\n${rendered}` +
+              `${changes.length}${truncated ? '+' : ''} change(s)\n` +
+              `  baseline: ${baselineName}\n` +
+              `  compare:  ${compareLabel}\n` +
+              `  (each line reads baseline → compare)\n\n${rendered}` +
               (truncated ? `\n\n(Truncated at ${limit}. Raise limit to see more.)` : ''),
           }],
         };
