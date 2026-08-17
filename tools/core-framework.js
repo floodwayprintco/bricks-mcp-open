@@ -41,7 +41,7 @@ import { createHash } from 'crypto';
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { getActiveSite, getActiveSiteKey } from '../site-manager.js';
+import { getActiveSite, getActiveSiteKey, listSites } from '../site-manager.js';
 
 const CF_NAMESPACE = '/wp-json/core-framework/v2';
 const SNAPSHOT_ROOT = join(homedir(), '.bricks-mcp', 'cf-snapshots');
@@ -317,35 +317,82 @@ function summariseCssObjects(preset) {
  * Snapshots
  * ------------------------------------------------------------------ */
 
+/**
+ * Snapshots are keyed by the site's HOST, not by its sites.json entry key.
+ *
+ * Floodway has two entries pointing at the same site — `production` (read-only
+ * by convention) and `production-admin` (elevated, for global style writes).
+ * Keying by entry key gave one site two separate snapshot histories, so a diff
+ * taken from one entry could not see snapshots taken from the other, and the
+ * split was invisible until you went looking for a snapshot that "vanished".
+ * The host is what actually identifies the design system.
+ */
+function hostSlug() {
+  const { url } = getActiveSite();
+  try {
+    return new URL(url).host.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+  } catch {
+    return getActiveSiteKey();   // malformed url — fall back rather than throw
+  }
+}
+
 function snapshotDir() {
-  return join(SNAPSHOT_ROOT, getActiveSiteKey());
+  return join(SNAPSHOT_ROOT, hostSlug());
+}
+
+/**
+ * Pre-host-keying directories, still readable so old snapshots are not orphaned.
+ * Returns one per sites.json entry sharing the active host — otherwise snapshots
+ * taken under `production-admin` stay invisible from `production`, which is the
+ * same split this change exists to remove.
+ */
+function legacySnapshotDirs() {
+  const host = hostSlug();
+  const dirs = new Set([getActiveSiteKey()]);
+  try {
+    for (const site of listSites()) {
+      try {
+        if (new URL(site.url).host.replace(/[^a-z0-9]+/gi, '-').toLowerCase() === host) {
+          dirs.add(site.key);
+        }
+      } catch { /* skip entries with an unparseable url */ }
+    }
+  } catch { /* site registry unavailable — active key alone still works */ }
+
+  return [...dirs].map(key => join(SNAPSHOT_ROOT, key)).filter(d => d !== snapshotDir());
 }
 
 function sha256(text) {
   return createHash('sha256').update(text).digest('hex');
 }
 
-function listSnapshots() {
-  const dir = snapshotDir();
+function readDirSnapshots(dir) {
   if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter(f => f.endsWith('.json'))
-    .sort()
-    .reverse();
+  return readdirSync(dir).filter(f => f.endsWith('.json'));
+}
+
+function listSnapshots() {
+  const all = [
+    ...readDirSnapshots(snapshotDir()),
+    ...legacySnapshotDirs().flatMap(readDirSnapshots),
+  ];
+  return [...new Set(all)].sort().reverse();
 }
 
 function readSnapshot(filename) {
-  const path = join(snapshotDir(), filename);
-  if (!existsSync(path)) {
-    const available = listSnapshots();
-    throw new Error(
-      `No snapshot "${filename}" for site "${getActiveSiteKey()}".` +
-      (available.length
-        ? `\nAvailable (newest first):\n  ${available.slice(0, 10).join('\n  ')}`
-        : `\nNo snapshots taken for this site yet — run cf_snapshot_preset first.`)
-    );
+  // Host-keyed directory first, then any legacy per-entry-key ones.
+  for (const dir of [snapshotDir(), ...legacySnapshotDirs()]) {
+    const path = join(dir, filename);
+    if (existsSync(path)) return JSON.parse(readFileSync(path, 'utf-8'));
   }
-  return JSON.parse(readFileSync(path, 'utf-8'));
+
+  const available = listSnapshots();
+  throw new Error(
+    `No snapshot "${filename}" for ${hostSlug()}.` +
+    (available.length
+      ? `\nAvailable (newest first):\n  ${available.slice(0, 10).join('\n  ')}`
+      : `\nNo snapshots taken for this site yet — run cf_snapshot_preset first.`)
+  );
 }
 
 /* ------------------------------------------------------------------ *
@@ -490,7 +537,7 @@ const coreFrameworkTools = [
               `  preset:  ${preset.name} (${preset.id})\n` +
               `  colours: ${summary.colours.length}\n` +
               `  updated: ${summary.preset.updatedAt}\n\n` +
-              `Diff a later state against it with cf_diff_preset { against: "${filename}" }.`,
+              `Diff a later state against it with cf_diff_preset { baseline: "${filename}" }.`,
           }],
         };
       } catch (error) {
