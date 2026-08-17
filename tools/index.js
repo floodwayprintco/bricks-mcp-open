@@ -20,6 +20,7 @@ import { wpContentTools } from './wp-content-tools.js';
 import { menuTools } from './menu-tools.js';
 import { securityTools } from './security.js';
 import { observabilityTools } from './observability.js';
+import { coreFrameworkTools } from './core-framework.js';
 
 export {
   pageTools,
@@ -48,4 +49,5 @@ export {
   menuTools,
   securityTools,
   observabilityTools,
+  coreFrameworkTools,
 };
