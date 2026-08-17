@@ -26,6 +26,7 @@ import {
   styleSystemTools, connectionTools, converterTools, elementorConverterTools,
   siteTools, advancedSeoTools, siteManagementTools,
   wpContentTools, menuTools, securityTools, observabilityTools,
+  coreFrameworkTools,
 } from './tools/index.js';
 import { setServer as setBatchServer } from './tools/batch.js';
 import * as callLog from './utils/call-log.js';
@@ -70,6 +71,7 @@ const TOOLS = [
   ...menuTools,
   ...securityTools,
   ...observabilityTools,
+  ...coreFrameworkTools,
 ];
 
 // O(1) tool lookup via Map (instead of O(n) array.find)
