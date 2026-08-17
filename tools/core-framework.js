@@ -232,6 +232,70 @@ function summarise(preset, bytes) {
     colours,
     typography,
     modules: Object.keys(preset.modulesData || {}),
+    fonts: summariseFonts(preset),
+    cssObjects: summariseCssObjects(preset),
+  };
+}
+
+/**
+ * CF's FONTS module holds font *configuration* independently of whether the
+ * files exist. Local carries a full Raleway import (18 @font-face across nine
+ * weights) pointing at uploads/core-framework/fonts/Raleway-*.woff2 — files
+ * that are no longer on disk. So "does CF have fonts" and "does the site serve
+ * them" are different questions, and reading one for the other is how this got
+ * recorded wrong once already.
+ */
+function summariseFonts(preset) {
+  const fonts = preset?.modulesData?.FONTS?.fonts || [];
+  return {
+    count: fonts.length,
+    families: fonts.map(f => ({
+      family: (f.cssPreview?.match(/font-family:\s*'([^']+)'/) || [])[1] || f.id,
+      category: f.category,
+      faces: (f.cssPreview?.match(/@font-face/g) || []).length,
+      referencedFiles: [...new Set((f.cssPreview?.match(/url\('([^']+)'\)/g) || []))].length,
+    })),
+  };
+}
+
+/**
+ * cssObjects is the compiled CSS representation stored inside the preset, and
+ * it can be badly stale: on Floodway production it is 154 KB carrying a :root
+ * with CF's default blue --primary (#2364a9) while the token data and the
+ * served stylesheet both say the brand gold. Harmless today because nothing
+ * recompiles from it, but it matters for any future write path, so surface its
+ * size and whether its --primary agrees with COLOR_SYSTEM rather than hiding
+ * 57% of the payload behind a summary.
+ */
+function summariseCssObjects(preset) {
+  const objects = preset?.cssObjects;
+  if (!Array.isArray(objects)) return { present: false };
+
+  const roots = objects.filter(o => o.selector === ':root');
+  let compiledPrimary = null;
+  for (const root of roots) {
+    const decl = (root.declarations || []).find(d => d.property === '--primary');
+    if (decl) { compiledPrimary = decl.value; break; }
+  }
+
+  const tokenPrimary = flattenColors(preset).find(c => c.name === 'primary')?.value ?? null;
+  const agrees = compiledPrimary && tokenPrimary
+    ? compiledPrimary.toLowerCase() === tokenPrimary.toLowerCase()
+    : null;
+
+  return {
+    present: true,
+    entries: objects.length,
+    bytes: JSON.stringify(objects).length,
+    rootBlocks: roots.length,
+    compiledPrimary,
+    tokenPrimary,
+    agreesWithTokens: agrees,
+    ...(agrees === false && {
+      warning: 'Compiled cssObjects disagrees with COLOR_SYSTEM. Stale compiled data — ' +
+               'check the served stylesheet before trusting either, and do not round-trip ' +
+               'this blob through a future PUT /preset.',
+    }),
   };
 }
 
