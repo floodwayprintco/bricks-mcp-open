@@ -188,6 +188,15 @@ function flattenColors(preset) {
  * resolves clamp(MIN, VAL, MAX) with MAX < MIN to MIN, so the step is pinned
  * rather than fluid. Settled as accept-and-document — see floodway-assistant#192.
  * Surfaced here so a future scale change does not reintroduce it unnoticed.
+ *
+ * 🚨 manualSizes is a PRECOMPUTED CACHE and can be stale. On Floodway both
+ * sites store text-2xl as calc(1.84vw + 1.69rem) while actually serving
+ * 1.9vw (production) and 1.55vw (local) — it was never regenerated after
+ * max_screen_width last changed. Comparing two sites' manualSizes therefore
+ * showed zero difference while the served stylesheets differed by 8.6px on
+ * text-4xl, which nearly buried floodway-assistant#196. So the summary carries
+ * an explicit staleness warning: for anything about RENDERED output, read the
+ * served stylesheet, never this.
  */
 function summariseTypography(preset) {
   const groups = preset?.modulesData?.FLUID_TYPOGRAPHY?.groups || [];
@@ -207,6 +216,11 @@ function summariseTypography(preset) {
       mode: group.mode,
       steps,
       pinnedSteps: steps.filter(s => s.pinned).map(s => s.name),
+      sourceWarning:
+        'These figures come from the preset\'s precomputed manualSizes cache, which is ' +
+        'NOT regenerated when max_screen_width changes and is currently stale on both ' +
+        'Floodway sites. For rendered output, read the served stylesheet ' +
+        '(uploads/core-framework/css/core_framework.css) instead. See floodway-assistant#196.',
     };
   });
 }
