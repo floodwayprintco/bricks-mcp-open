@@ -1,10 +1,11 @@
 /**
- * Core Framework Tools — READ ONLY
+ * Core Framework Tools
  *
  * Core Framework is the design system behind the site: colour tokens, the fluid
  * type scale, spacing, layouts. Until CF 2.0 (MIT, 2026-08-13) none of it was
  * reachable from here, so token changes were manual wp-admin clicks with no
- * snapshot and no rollback record. These tools close the read half of that gap.
+ * snapshot and no rollback record. The read tools closed that gap first; the
+ * write tools followed once the compiler was vendored (see below).
  *
  * Auth
  * ----
@@ -26,21 +27,32 @@
  * The full key is `<24 random chars><url-encoded site url>`. Either the full
  * string or just the 24-char head authenticates, since only the head is compared.
  *
- * Deliberately read-only
- * ----------------------
- * There are no write tools in this module, and that is not an oversight.
+ * Writes ship data and stylesheet together
+ * ----------------------------------------
  * **The CF server never compiles CSS.** `PUT /preset` stores token JSON in the
  * presets table; `PUT /preset-css` accepts ALREADY-COMPILED CSS and writes the
  * stylesheet. The client is the compiler. So a token write that does not also
  * ship freshly compiled CSS leaves the stored data and the served stylesheet
- * disagreeing, silently, with the site rendering the stale one. Writes wait
- * until the compiler from packages/core is ported and a round-trip is proven on
- * local. See floodway-assistant#190.
+ * disagreeing, silently, with the site rendering the stale one. The write tools
+ * therefore compile with Core Framework's own compiler, vendored as a Node
+ * bundle in vendor/core-framework/ (output proven byte-identical to local's
+ * served stylesheet), and always send both PUTs as one operation.
+ *
+ * Two rules the write path enforces by construction (floodway-assistant#190):
+ *
+ *   1. The preset's stored top-level `cssObjects` is a stale write-through
+ *      cache — on Floodway production it still carries CF's default blue
+ *      palette from before the rebrand. It is NEVER round-tripped: when the
+ *      read preset has the key it is replaced with freshly regenerated
+ *      objects, and when it is absent it stays absent.
+ *   2. Every applying write snapshots the live preset to disk first, so there
+ *      is always a rollback target. cf_restore_preset closes the loop.
  */
 import { createHash } from 'crypto';
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { createRequire } from 'module';
 import { getActiveSite, getActiveSiteKey, listSites } from '../site-manager.js';
 
 const CF_NAMESPACE = '/wp-json/core-framework/v2';
@@ -147,6 +159,233 @@ async function cfGet(route) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * PUT a CF api-key route on the active site. Same channel as cfGet; the key
+ * still travels as a query param because that is the only place CF looks.
+ */
+async function cfPut(route, body) {
+  const site = getActiveSite();
+  const key = resolveCfKey();
+  const url = `${site.url}${CF_NAMESPACE}${route}?key=${encodeURIComponent(key)}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
+  try {
+    const response = await fetch(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    if (response.status === 401 || response.status === 403) {
+      throw new Error(
+        `Core Framework rejected the API key for site "${site.key}" (HTTP ${response.status}) on ${route}. ` +
+        `Check sites.${site.key}.cfApiKey against wp-admin → Core Framework on ${site.url}.`
+      );
+    }
+
+    const text = await response.text();
+    let parsed = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch { /* handled below */ }
+
+    if (!response.ok || parsed?.success === false) {
+      const detail = parsed?.message || text.slice(0, 200) || '(empty body)';
+      throw new Error(`Core Framework write failed on ${route} (HTTP ${response.status}): ${detail}`);
+    }
+
+    return parsed ?? {};
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error(`Core Framework write timed out after ${REQUEST_TIMEOUT}ms on ${route}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * The vendored compiler
+ * ------------------------------------------------------------------ */
+
+/**
+ * Core Framework's own compiler, bundled from upstream sources — see
+ * vendor/core-framework/README.md for provenance and the byte-fidelity proof.
+ * Loaded lazily so the read tools never pay the 1.7 MB parse.
+ */
+let compilerModule = null;
+function loadCompiler() {
+  if (!compilerModule) {
+    const require = createRequire(import.meta.url);
+    compilerModule = require('../vendor/core-framework/cf-compiler.cjs');
+  }
+  return compilerModule;
+}
+
+/**
+ * Compile a preset the way the wp-admin app's save button does, and build the
+ * exact payload PUT /preset should carry.
+ *
+ * The stored top-level cssObjects is a stale write-through cache (the
+ * dead-palette trap from floodway-assistant#190): it is never reused. When the
+ * incoming preset carries the key it is REPLACED with freshly regenerated
+ * objects so the stored data heals; when absent it stays absent, matching how
+ * local's preset looks.
+ */
+async function compileForWrite(preset, { gutenbergEnabled = false } = {}) {
+  const { compilePreset, sanitizePreset } = loadCompiler();
+  const { css, cssMinified, cssObjects } = await compilePreset(preset, { gutenbergEnabled });
+
+  const payload = sanitizePreset(preset);
+  if (Object.prototype.hasOwnProperty.call(payload, 'cssObjects')) {
+    payload.cssObjects = cssObjects;
+  }
+  payload.updatedAt = Date.now();
+
+  return { css, cssMinified, payload };
+}
+
+/* ------------------------------------------------------------------ *
+ * Write-path plumbing
+ * ------------------------------------------------------------------ */
+
+/** Walk a dotted path ("modulesData.COLOR_SYSTEM.groups.0.colors.0.value"). */
+function getAtPath(obj, path) {
+  const segments = String(path).split('.');
+  let node = obj;
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    if (node === null || typeof node !== 'object' || !(segment in node)) {
+      return { exists: false, failedAt: segments.slice(0, i + 1).join('.') };
+    }
+    node = node[segment];
+  }
+  return { exists: true, value: node };
+}
+
+function jsonType(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  return typeof value;
+}
+
+/**
+ * Apply { path, value } changes to a deep copy of the preset. Strict: every
+ * path must already exist (a typo must fail, not silently grow the preset),
+ * and the replacement must keep the JSON type unless the old value was null.
+ */
+function applyChanges(preset, changes) {
+  const mutated = JSON.parse(JSON.stringify(preset));
+  const applied = [];
+
+  for (const change of changes) {
+    const { path, value } = change;
+    if (!path || value === undefined) {
+      throw new Error(`Each change needs a "path" and a "value". Got: ${JSON.stringify(change).slice(0, 200)}`);
+    }
+
+    const current = getAtPath(mutated, path);
+    if (!current.exists) {
+      throw new Error(
+        `Path "${path}" does not exist in the preset (failed at "${current.failedAt}"). ` +
+        `Writes never create new paths — check the path with cf_get_preset or cf_diff_preset first.`
+      );
+    }
+
+    const beforeType = jsonType(current.value);
+    const afterType = jsonType(value);
+    if (beforeType !== 'null' && beforeType !== afterType) {
+      throw new Error(
+        `Path "${path}" holds a ${beforeType} but the new value is a ${afterType}. ` +
+        `Type changes are refused — they are almost always a mis-aimed path.`
+      );
+    }
+
+    const segments = String(path).split('.');
+    const last = segments.pop();
+    let node = mutated;
+    for (const segment of segments) node = node[segment];
+    node[last] = value;
+
+    applied.push({ path, before: current.value, after: value });
+  }
+
+  return { mutated, applied };
+}
+
+/** The stylesheet CF 2.0 serves, fetched fresh past any page cache. */
+async function fetchServedCss() {
+  const site = getActiveSite();
+  const url = `${site.url}/wp-content/uploads/core-framework/css/core_framework.css?cfmcp=${Date.now()}`;
+  const response = await fetch(url, { headers: { 'Accept': 'text/css,*/*' } });
+  if (!response.ok) {
+    throw new Error(`Could not fetch the served stylesheet (HTTP ${response.status}) from ${url}`);
+  }
+  const text = await response.text();
+  return { text, bytes: Buffer.byteLength(text), md5: createHash('md5').update(text).digest('hex') };
+}
+
+/** First rules that differ between two minified stylesheets, for the report. */
+function diffRules(beforeCss, afterCss, limit = 10) {
+  const split = (css) => css.split('}').map(r => r.trim()).filter(Boolean);
+  const before = split(beforeCss);
+  const after = split(afterCss);
+  const beforeSet = new Set(before);
+  const afterSet = new Set(after);
+  const removed = before.filter(r => !afterSet.has(r)).slice(0, limit);
+  const added = after.filter(r => !beforeSet.has(r)).slice(0, limit);
+  return { removed, added };
+}
+
+/** Snapshot a preset to disk; shared by cf_snapshot_preset and every write. */
+function writeSnapshotToDisk(preset, label) {
+  const dir = snapshotDir();
+  mkdirSync(dir, { recursive: true });
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const slug = label ? '-' + String(label).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') : '';
+  const filename = `${stamp}${slug}.json`;
+  const path = join(dir, filename);
+
+  const serialised = JSON.stringify(preset, null, 2);
+  writeFileSync(path, serialised, 'utf-8');
+
+  return { filename, path, bytes: serialised.length, sha256: sha256(serialised).slice(0, 16) };
+}
+
+/**
+ * The apply half shared by cf_update_preset and cf_restore_preset:
+ * snapshot the live state, PUT the preset, PUT the compiled CSS, then verify
+ * both by reading them back. Data first, stylesheet second — if the second
+ * write fails the served CSS is stale rather than orphaned, and the verify
+ * step says so explicitly.
+ */
+async function applyWrite({ livePreset, payload, cssMinified, snapshotLabel, verifyPaths = [] }) {
+  const snapshot = writeSnapshotToDisk(livePreset, snapshotLabel);
+
+  await cfPut('/preset', { preset: payload });
+  const cssResult = await cfPut('/preset-css', { css: cssMinified });
+
+  // Verify the data half: re-read and confirm every mutated path landed.
+  const { data: reread } = await cfGet('/preset');
+  const verifyFailures = [];
+  for (const { path, after } of verifyPaths) {
+    const now = getAtPath(reread, path);
+    if (!now.exists || JSON.stringify(now.value) !== JSON.stringify(after)) {
+      verifyFailures.push({ path, expected: after, found: now.exists ? now.value : '(absent)' });
+    }
+  }
+
+  // Verify the stylesheet half: the site must now serve exactly what was compiled.
+  const served = await fetchServedCss();
+  const compiledMd5 = createHash('md5').update(cssMinified).digest('hex');
+  const cssMatches = served.md5 === compiledMd5;
+
+  return { snapshot, cssResult, verifyFailures, served, compiledMd5, cssMatches };
 }
 
 /* ------------------------------------------------------------------ *
@@ -512,16 +751,7 @@ const coreFrameworkTools = [
         const { label } = args;
         const { data: preset, bytes } = await cfGet('/preset');
 
-        const dir = snapshotDir();
-        mkdirSync(dir, { recursive: true });
-
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const slug = label ? '-' + String(label).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') : '';
-        const filename = `${stamp}${slug}.json`;
-        const path = join(dir, filename);
-
-        const serialised = JSON.stringify(preset, null, 2);
-        writeFileSync(path, serialised, 'utf-8');
+        const written = writeSnapshotToDisk(preset, label);
 
         const site = getActiveSite();
         const summary = summarise(preset, bytes);
@@ -531,13 +761,13 @@ const coreFrameworkTools = [
             type: 'text',
             text:
               `Snapshot written for ${site.label} [${site.key}]\n\n` +
-              `  file:    ${path}\n` +
-              `  size:    ${serialised.length.toLocaleString()} bytes\n` +
-              `  sha256:  ${sha256(serialised).slice(0, 16)}\n` +
+              `  file:    ${written.path}\n` +
+              `  size:    ${written.bytes.toLocaleString()} bytes\n` +
+              `  sha256:  ${written.sha256}\n` +
               `  preset:  ${preset.name} (${preset.id})\n` +
               `  colours: ${summary.colours.length}\n` +
               `  updated: ${summary.preset.updatedAt}\n\n` +
-              `Diff a later state against it with cf_diff_preset { baseline: "${filename}" }.`,
+              `Diff a later state against it with cf_diff_preset { baseline: "${written.filename}" }.`,
           }],
         };
       } catch (error) {
@@ -630,6 +860,228 @@ const coreFrameworkTools = [
         };
       } catch (error) {
         return { content: [{ type: 'text', text: `Error diffing Core Framework preset: ${error.message}` }], isError: true };
+      }
+    },
+  },
+  {
+    name: 'cf_update_preset',
+    description:
+      'Change Core Framework design tokens on the active site: mutate values by dotted path, recompile the stylesheet ' +
+      'with CF\'s own vendored compiler, and ship preset + CSS together (the CF server never compiles). ' +
+      'DEFAULTS TO DRY RUN: it reports exactly what would change, including the CSS rule diff, without writing. ' +
+      'Pass apply=true to write — that snapshots the live preset to disk first, sends both PUTs, and verifies the ' +
+      'mutation and the served stylesheet by reading them back. Production writes are one change per approval with the ' +
+      'dry run shown first, same as every other live-site rule.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        changes: {
+          type: 'array',
+          description:
+            'Mutations as { path, value }. Paths are dotted, exactly as cf_diff_preset reports them, ' +
+            'e.g. "modulesData.COLOR_SYSTEM.groups.0.colors.0.value". Every path must already exist.',
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' },
+              value: { description: 'New value. Must keep the JSON type of the old value.' },
+            },
+            required: ['path', 'value'],
+          },
+          minItems: 1,
+        },
+        apply: {
+          type: 'boolean',
+          description: 'false (default) = dry run, report only. true = snapshot, write, verify.',
+          default: false,
+        },
+        label: {
+          type: 'string',
+          description: 'Slug for the automatic before-write snapshot, e.g. "primary-shade-retune".',
+        },
+        gutenbergEnabled: {
+          type: 'boolean',
+          description: 'Append the Gutenberg addon\'s .wp-block{} marker. Off on both Floodway sites.',
+          default: false,
+        },
+      },
+      required: ['changes'],
+    },
+    handler: async (args = {}) => {
+      try {
+        const { changes, apply = false, label, gutenbergEnabled = false } = args;
+        if (!Array.isArray(changes) || !changes.length) {
+          throw new Error('changes must be a non-empty array of { path, value }.');
+        }
+        const site = getActiveSite();
+
+        const { data: livePreset } = await cfGet('/preset');
+        const { mutated, applied } = applyChanges(livePreset, changes);
+        const { css, cssMinified, payload } = await compileForWrite(mutated, { gutenbergEnabled });
+
+        const served = await fetchServedCss();
+        const compiledMd5 = createHash('md5').update(cssMinified).digest('hex');
+        const rules = diffRules(served.text, cssMinified);
+
+        const clip = (v) => {
+          const s = JSON.stringify(v);
+          return s.length > 100 ? s.slice(0, 97) + '...' : s;
+        };
+        const changesReport = applied
+          .map(c => `  ${c.path}\n      ${clip(c.before)}  →  ${clip(c.after)}`)
+          .join('\n');
+        const rulesReport =
+          (rules.removed.length ? `  - ${rules.removed.join('}\n  - ')}}\n` : '') +
+          (rules.added.length ? `  + ${rules.added.join('}\n  + ')}}` : '');
+
+        if (!apply) {
+          return {
+            content: [{
+              type: 'text',
+              text:
+                `DRY RUN on ${site.label} [${site.key}] — nothing written.\n\n` +
+                `Token change(s):\n${changesReport}\n\n` +
+                `Stylesheet: served ${served.bytes.toLocaleString()} bytes (${served.md5.slice(0, 12)}) → ` +
+                `compiled ${Buffer.byteLength(cssMinified).toLocaleString()} bytes (${compiledMd5.slice(0, 12)})\n` +
+                `CSS rules that change:\n${rulesReport || '  (none — the mutated tokens do not reach the stylesheet)'}\n\n` +
+                `To write this, re-run with apply=true. That snapshots first, ships preset + CSS together, and verifies both.`,
+            }],
+          };
+        }
+
+        const result = await applyWrite({
+          livePreset,
+          payload,
+          cssMinified,
+          snapshotLabel: label || 'before-cf-update',
+          verifyPaths: applied,
+        });
+
+        const verifyText = result.verifyFailures.length
+          ? `❌ VERIFY FAILED for ${result.verifyFailures.length} path(s):\n` +
+            result.verifyFailures.map(f => `  ${f.path}: expected ${clip(f.expected)}, found ${clip(f.found)}`).join('\n')
+          : `✓ all ${applied.length} path(s) verified in the re-read preset`;
+        const cssText = result.cssMatches
+          ? `✓ served stylesheet matches the compiled output (md5 ${result.compiledMd5.slice(0, 12)}, ${result.served.bytes.toLocaleString()} bytes)`
+          : `❌ served stylesheet does NOT match: compiled ${result.compiledMd5.slice(0, 12)}, served ${result.served.md5.slice(0, 12)}. ` +
+            `A cache may still be settling — re-fetch before assuming failure, and if it persists restore with ` +
+            `cf_restore_preset { snapshot: "${result.snapshot.filename}" }.`;
+
+        return {
+          content: [{
+            type: 'text',
+            text:
+              `Core Framework write applied on ${site.label} [${site.key}]\n\n` +
+              `Token change(s):\n${changesReport}\n\n` +
+              `Rollback snapshot: ${result.snapshot.filename} (${result.snapshot.bytes.toLocaleString()} bytes, sha256 ${result.snapshot.sha256})\n` +
+              `Stylesheet written: ${result.cssResult.bytes_saved?.toLocaleString?.() ?? '?'} bytes\n\n` +
+              `${verifyText}\n${cssText}\n\n` +
+              `Restore the previous state any time: cf_restore_preset { snapshot: "${result.snapshot.filename}" }`,
+          }],
+        };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `Error writing Core Framework preset: ${error.message}` }], isError: true };
+      }
+    },
+  },
+
+  {
+    name: 'cf_restore_preset',
+    description:
+      'Roll the active site\'s Core Framework design system back to a disk snapshot: recompiles the snapshot\'s ' +
+      'preset with the vendored compiler and ships preset + CSS together. DEFAULTS TO DRY RUN — pass apply=true to ' +
+      'write, which snapshots the current live state first so a restore is itself reversible. ' +
+      'List snapshots with cf_diff_preset (no arguments).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        snapshot: {
+          type: 'string',
+          description: 'Snapshot filename to restore, as listed by cf_diff_preset.',
+        },
+        apply: {
+          type: 'boolean',
+          description: 'false (default) = dry run, report only. true = snapshot current state, write, verify.',
+          default: false,
+        },
+        gutenbergEnabled: {
+          type: 'boolean',
+          description: 'Append the Gutenberg addon\'s .wp-block{} marker. Off on both Floodway sites.',
+          default: false,
+        },
+      },
+      required: ['snapshot'],
+    },
+    handler: async (args = {}) => {
+      try {
+        const { snapshot: snapshotName, apply = false, gutenbergEnabled = false } = args;
+        const site = getActiveSite();
+
+        const snapshotPreset = readSnapshot(snapshotName);
+        const { data: livePreset } = await cfGet('/preset');
+
+        const tokenChanges = diffValues(livePreset, snapshotPreset, '', [], 50)
+          .filter(c => !c.path.startsWith('cssObjects') && c.path !== 'updatedAt' && c.path !== 'app_version');
+
+        const { cssMinified, payload } = await compileForWrite(snapshotPreset, { gutenbergEnabled });
+        const served = await fetchServedCss();
+        const compiledMd5 = createHash('md5').update(cssMinified).digest('hex');
+        const rules = diffRules(served.text, cssMinified);
+
+        const clip = (v) => {
+          if (v === undefined) return '(absent)';
+          const s = JSON.stringify(v);
+          return s.length > 100 ? s.slice(0, 97) + '...' : s;
+        };
+        const changesReport = tokenChanges.length
+          ? tokenChanges.map(c => `  ${c.path}\n      ${clip(c.before)}  →  ${clip(c.after)}`).join('\n')
+          : '  (no token differences — only the stylesheet would be recompiled)';
+        const rulesReport =
+          (rules.removed.length ? `  - ${rules.removed.join('}\n  - ')}}\n` : '') +
+          (rules.added.length ? `  + ${rules.added.join('}\n  + ')}}` : '');
+
+        if (!apply) {
+          return {
+            content: [{
+              type: 'text',
+              text:
+                `DRY RUN restore of ${snapshotName} on ${site.label} [${site.key}] — nothing written.\n\n` +
+                `Token change(s), live → snapshot:\n${changesReport}\n\n` +
+                `CSS rules that change:\n${rulesReport || '  (none)'}\n\n` +
+                `To restore, re-run with apply=true.`,
+            }],
+          };
+        }
+
+        const result = await applyWrite({
+          livePreset,
+          payload,
+          cssMinified,
+          snapshotLabel: `before-restore`,
+          verifyPaths: tokenChanges.filter(c => c.after !== undefined).map(c => ({ path: c.path, after: c.after })),
+        });
+
+        const verifyText = result.verifyFailures.length
+          ? `❌ VERIFY FAILED for ${result.verifyFailures.length} path(s):\n` +
+            result.verifyFailures.map(f => `  ${f.path}: expected ${clip(f.expected)}, found ${clip(f.found)}`).join('\n')
+          : `✓ restored token paths verified in the re-read preset`;
+        const cssText = result.cssMatches
+          ? `✓ served stylesheet matches the compiled output (md5 ${result.compiledMd5.slice(0, 12)}, ${result.served.bytes.toLocaleString()} bytes)`
+          : `❌ served stylesheet does NOT match: compiled ${result.compiledMd5.slice(0, 12)}, served ${result.served.md5.slice(0, 12)}. ` +
+            `A cache may still be settling — re-fetch before assuming failure.`;
+
+        return {
+          content: [{
+            type: 'text',
+            text:
+              `Restored ${snapshotName} on ${site.label} [${site.key}]\n\n` +
+              `Pre-restore state saved as: ${result.snapshot.filename}\n` +
+              `Stylesheet written: ${result.cssResult.bytes_saved?.toLocaleString?.() ?? '?'} bytes\n\n` +
+              `${verifyText}\n${cssText}`,
+          }],
+        };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `Error restoring Core Framework preset: ${error.message}` }], isError: true };
       }
     },
   },
