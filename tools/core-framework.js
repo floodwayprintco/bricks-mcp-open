@@ -101,7 +101,11 @@ function resolveCfKey() {
 async function cfGet(route) {
   const site = getActiveSite();
   const key = resolveCfKey();
-  const url = `${site.url}${CF_NAMESPACE}${route}?key=${encodeURIComponent(key)}`;
+  // Cache-bust every read. SiteGround caches REST GETs by full URL, so without
+  // this a write's verify re-read can be served the response cached seconds
+  // earlier by the dry run — which is exactly what happened on the first
+  // production write: the data landed, the verify reported it hadn't.
+  const url = `${site.url}${CF_NAMESPACE}${route}?key=${encodeURIComponent(key)}&cfmcp=${Date.now()}`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
