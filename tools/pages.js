@@ -6,6 +6,7 @@ import { wpGet, wpGetCached, wpPut, wpPatch, wpPost, wpFetch, wpDelete } from '.
 import { cache, TTL } from '../utils/cache.js';
 import { validateContent, isValidBricksId } from '../utils/validator.js';
 import { autofix } from '../utils/autofix.js';
+import { summarizePatchResult } from '../utils/patch-result.js';
 import { getActiveSiteKey } from '../site-manager.js';
 import { classifyCss, formatEditableCssWarning } from '../utils/css-classify.js';
 
@@ -231,14 +232,20 @@ const pageTools = [
         const patchOptions = content_hash ? { contentHash: content_hash } : {};
         const result = await wpPatch(endpoint, body, patchOptions);
 
-        // Smart response: show what was changed
-        const parts = [];
-        if (fixedAdd.length > 0) parts.push(`Added ${fixedAdd.length}: ${fixedAdd.map(e => e.id).join(', ')}`);
-        if (update.length > 0) parts.push(`Updated ${update.length}: ${update.map(e => e.id).join(', ')}`);
-        if (remove.length > 0) parts.push(`Removed ${remove.length}: ${remove.join(', ')}`);
-        const fixInfo = addFixLog.length > 0 ? `\nAuto-fixed ${addFixLog.length} issue(s) in added elements.` : '';
-
-        return { content: [{ type: 'text', text: `Page ${page_id} patched.\n${parts.join('\n')}\nTotal elements: ${result.element_count || 'unknown'}${fixInfo}\n\nPage state updated. No need to re-fetch full page.` }] };
+        // Report from the server's result, not the request (floodway-inbox#291).
+        const summary = summarizePatchResult({
+          pageId: page_id,
+          contentArea: content_area,
+          add: fixedAdd,
+          update,
+          remove,
+          result,
+          addFixLog,
+        });
+        if (!summary.ok) {
+          return { isError: true, content: [{ type: 'text', text: summary.text }] };
+        }
+        return { content: [{ type: 'text', text: summary.text }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `Error patching page: ${error.message}` }] };
       }

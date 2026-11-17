@@ -8,7 +8,7 @@
  * Requires learnings to be passed in — autofix itself is pure (no API calls).
  */
 
-import { isValidBricksId } from './validator.js';
+import { isValidBricksId, isPxSafePath } from './validator.js';
 
 /**
  * Lenient ID check for autofix — accepts any lowercase alphanumeric string (3-12 chars).
@@ -28,14 +28,9 @@ function isAcceptableBricksId(id) {
   return true;
 }
 
-/**
- * Keys whose string values should never be stripped of "px".
- */
-const PX_SAFE_KEYS = new Set([
-  'content', '_cssCustom', 'url', 'name', 'label', 'tag',
-  'link', 'href', 'src', 'alt', 'placeholder', 'icon', 'class',
-  'text', 'title', 'description',
-]);
+// PX_SAFE_KEYS and isPxSafePath live in validator.js so the fixer and the validator
+// can never disagree about which values are px-safe. If they did, autofix would
+// keep a value that validateContent() then rejects.
 
 /**
  * Flex-related settings that indicate a block should be a container.
@@ -132,28 +127,36 @@ function rewriteIdReferences(content, oldId, newId) {
 
 /**
  * Recursively strip bare "px" values from settings.
- * "80px" → "80", but leaves _cssCustom, content, text, etc. untouched.
+ * "80px" → "80", but leaves _cssCustom, content, text, icon.height, etc. untouched.
+ *
+ * `path` is the full key path from the element's settings root; it is what the
+ * PX_SAFE_KEYS allowlist is tested against, so a safe key protects its whole
+ * subtree. `currentKey` is kept for direct callers of the exported function and
+ * is used only when no path has been accumulated yet.
  */
-function stripPxValues(obj, currentKey = '', log, elementId) {
+function stripPxValues(obj, currentKey = '', log, elementId, path = []) {
   if (obj === null || obj === undefined) return obj;
 
+  const keyPath = path.length ? path : (currentKey ? [currentKey] : []);
+
   if (typeof obj === 'string') {
-    if (!PX_SAFE_KEYS.has(currentKey) && /^\d+px$/.test(obj)) {
+    if (!isPxSafePath(keyPath) && /^\d+px$/.test(obj)) {
       const fixed = obj.replace(/px$/, '');
-      log.push(`Stripped px: "${obj}" → "${fixed}" on element ${elementId}, key "${currentKey}"`);
+      const where = keyPath.join('.') || currentKey;
+      log.push(`Stripped px: "${obj}" → "${fixed}" on element ${elementId}, key "${where}"`);
       return fixed;
     }
     return obj;
   }
 
   if (Array.isArray(obj)) {
-    return obj.map((item, i) => stripPxValues(item, currentKey, log, elementId));
+    return obj.map((item) => stripPxValues(item, currentKey, log, elementId, keyPath));
   }
 
   if (typeof obj === 'object') {
     const result = {};
     for (const [key, value] of Object.entries(obj)) {
-      result[key] = stripPxValues(value, key, log, elementId);
+      result[key] = stripPxValues(value, key, log, elementId, keyPath.concat(key));
     }
     return result;
   }
@@ -346,16 +349,16 @@ function autofix(content, options = {}) {
   }
 
   // === Pass 1: Strip bare px values ===
-  // Skipped on 'preserve' — Floodway divergence from upstream v1.2.4 (2026-07-31).
-  // PX_SAFE_KEYS does not cover nested keys like icon.height, so a preserve save of
-  // human-authored content rewrote "20px" → "20". Bricks itself writes "20px" there
-  // (every icon in the Header Test template stores it that way), so the strip is a
-  // deviation, not a fix. Generated content still gets normalized.
-  if (mode === 'normalize') {
-    for (const el of content) {
-      if (el && el.settings && typeof el.settings === 'object') {
-        el.settings = stripPxValues(el.settings, '', log, el.id || '?');
-      }
+  // Runs in BOTH modes. It was briefly skipped on 'preserve' (2026-07-31) because the
+  // allowlist only matched the immediate key, so icon.height "20px" was rewritten.
+  // The allowlist is now matched against the whole settings path (isPxSafePath), so
+  // that reason is gone — and skipping it had a worse cost: a preserve save handed
+  // site-authored values like _margin.top "0px" straight to validateContent(), which
+  // rejects bare px, so a template read with bricks_get_template could not be written
+  // back unmodified (floodway-inbox#291). Every strip is reported in the fix log.
+  for (const el of content) {
+    if (el && el.settings && typeof el.settings === 'object') {
+      el.settings = stripPxValues(el.settings, '', log, el.id || '?');
     }
   }
 

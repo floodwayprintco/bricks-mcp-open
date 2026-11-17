@@ -159,12 +159,33 @@ function isValidBricksId(id) {
   return true;
 }
 
+/**
+ * Keys whose string values may legitimately carry "px".
+ *
+ * Shared by autofix.js (which strips px) and findPxValues (which rejects it), and
+ * matched against the whole settings path, not just the immediate key: `icon`
+ * protects `icon.height` and `icon.width` exactly as it protects a bare `icon`
+ * string. Mirrored in plugin/includes/class-autofix.php and class-validator.php.
+ */
 const PX_SAFE_KEYS = new Set([
   'content', '_cssCustom', 'url', 'name', 'label', 'tag',
   'link', 'href', 'src', 'alt', 'placeholder', 'icon', 'class',
   'text', 'title', 'description',
 ]);
 
+/**
+ * True when any segment of the settings key path is px-safe.
+ *
+ * @param {string[]} path - Key path from the element's settings root.
+ */
+function isPxSafePath(path) {
+  for (const segment of path) {
+    if (PX_SAFE_KEYS.has(segment)) return true;
+  }
+  return false;
+}
+
+// Returning [] on a safe key before recursing already protects the whole subtree.
 function findPxValues(obj, path = '', currentKey = '') {
   if (PX_SAFE_KEYS.has(currentKey)) return [];
 
@@ -412,4 +433,4 @@ function validateContent(content) {
   };
 }
 
-export { isValidBricksId, findPxValues, validateContent, validatePatch, VALID_ELEMENT_NAMES, VALID_PATCH_MODES };
+export { isValidBricksId, findPxValues, isPxSafePath, PX_SAFE_KEYS, validateContent, validatePatch, VALID_ELEMENT_NAMES, VALID_PATCH_MODES };

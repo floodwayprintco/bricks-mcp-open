@@ -593,6 +593,57 @@ class Bricks_API_Bridge_Pages {
 		// Create backup BEFORE modifying data.
 		$this->backup_manager->create_backup( $post_id );
 
+		// Which requested IDs actually exist in this content area. The response used to
+		// echo the request back ("updated" => count($update)), so a patch aimed at the
+		// wrong area matched nothing, wrote nothing useful, and still reported success
+		// (floodway-inbox#291).
+		$existing_lookup      = array_flip( $existing_ids );
+		$matched_update_ids   = array();
+		$unmatched_update_ids = array();
+		foreach ( $update as $upd ) {
+			if ( ! is_array( $upd ) || ! isset( $upd['id'] ) ) {
+				continue;
+			}
+			if ( isset( $existing_lookup[ $upd['id'] ] ) ) {
+				$matched_update_ids[] = $upd['id'];
+			} else {
+				$unmatched_update_ids[] = $upd['id'];
+			}
+		}
+		$matched_remove_ids   = array();
+		$unmatched_remove_ids = array();
+		foreach ( (array) $remove as $rid ) {
+			if ( is_string( $rid ) && isset( $existing_lookup[ $rid ] ) ) {
+				$matched_remove_ids[] = $rid;
+			} else {
+				$unmatched_remove_ids[] = $rid;
+			}
+		}
+
+		// Nothing to add and no requested ID exists here: refuse rather than save the
+		// area back unchanged and call it a success.
+		$requested = count( $update ) + count( (array) $remove );
+		if ( empty( $add ) && $requested > 0 && empty( $matched_update_ids ) && empty( $matched_remove_ids ) ) {
+			return new WP_Error(
+				'bricks_api_bridge_patch_no_match',
+				sprintf(
+					/* translators: 1: content area, 2: number of elements in it, 3: requested IDs */
+					__( 'No element matched in content_area "%1$s" (%2$d elements there). Requested: %3$s. Nothing was written. Header and footer templates need content_area "header" or "footer".', 'bricks-api-bridge' ),
+					$content_area,
+					count( $current ),
+					implode( ', ', array_merge( $unmatched_update_ids, $unmatched_remove_ids ) )
+				),
+				array(
+					'status'        => 404,
+					'content_area'  => $content_area,
+					'element_count' => count( $current ),
+					'unmatched_ids' => array_merge( $unmatched_update_ids, $unmatched_remove_ids ),
+				)
+			);
+		}
+
+		$count_before_remove = count( $current );
+
 		// Remove elements (including children).
 		if ( ! empty( $remove ) ) {
 			$to_remove = array_flip( $remove );
@@ -615,6 +666,8 @@ class Bricks_API_Bridge_Pages {
 				)
 			);
 		}
+
+		$removed_total = $count_before_remove - count( $current );
 
 		// Update elements. Default mode is "merge" (deep-merge settings, preserves
 		// keys not in the patch). Pass `mode: "replace"` per-update to overwrite
@@ -720,12 +773,20 @@ class Bricks_API_Bridge_Pages {
 			$alts_written = Bricks_API_Bridge_Quirks_Coercion::write_image_alts( $pending_alts );
 		}
 
+		// Counts come from what matched, not from the request (floodway-inbox#291).
+		// `removed_total` includes cascaded children.
 		$response = array(
-			'success'       => true,
-			'element_count' => count( $current ),
-			'added'         => count( $add ),
-			'updated'       => count( $update ),
-			'removed'       => count( $remove ),
+			'success'              => true,
+			'content_area'         => $content_area,
+			'element_count'        => count( $current ),
+			'added'                => count( $add ),
+			'updated'              => count( $matched_update_ids ),
+			'updated_ids'          => $matched_update_ids,
+			'unmatched_update_ids' => $unmatched_update_ids,
+			'removed'              => count( $matched_remove_ids ),
+			'removed_ids'          => $matched_remove_ids,
+			'removed_total'        => $removed_total,
+			'unmatched_remove_ids' => $unmatched_remove_ids,
 		);
 
 		if ( ! empty( $fix_log ) ) {

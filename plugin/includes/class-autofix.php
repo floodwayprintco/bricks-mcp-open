@@ -404,10 +404,24 @@ class Bricks_API_Bridge_Autofix {
 	}
 
 	/**
+	 * Whether a settings key marks a px-safe subtree.
+	 *
+	 * A safe key protects everything beneath it: `icon` covers `icon.height` and
+	 * `icon.width`, which Bricks itself stores as "20px". Mirrors isPxSafePath() in
+	 * the MCP server's utils/validator.js (floodway-inbox#291).
+	 *
+	 * @param mixed $key Settings key.
+	 * @return bool
+	 */
+	public static function is_px_safe_key( $key ) {
+		return is_string( $key ) && in_array( $key, self::$px_safe_keys, true );
+	}
+
+	/**
 	 * Recursively strip bare "px" values from settings.
 	 *
-	 * @param mixed  $value      The value to process.
-	 * @param string $current_key Current key name for safe-key checks.
+	 * @param mixed  $value       The value to process.
+	 * @param string $current_key Current key path, for logging.
 	 * @param array  $log         Log array (passed by reference).
 	 * @param string $element_id  Element ID for logging.
 	 * @return mixed
@@ -418,7 +432,7 @@ class Bricks_API_Bridge_Autofix {
 		}
 
 		if ( is_string( $value ) ) {
-			if ( ! in_array( $current_key, self::$px_safe_keys, true ) && preg_match( '/^\d+px$/', $value ) ) {
+			if ( preg_match( '/^\d+px$/', $value ) ) {
 				$fixed = preg_replace( '/px$/', '', $value );
 				$log[] = sprintf( 'Stripped px: "%s" → "%s" on element %s, key "%s"', $value, $fixed, $element_id, $current_key );
 				return $fixed;
@@ -428,7 +442,12 @@ class Bricks_API_Bridge_Autofix {
 
 		if ( is_array( $value ) ) {
 			foreach ( $value as $k => $v ) {
-				$value[ $k ] = self::strip_px_values( $v, is_string( $k ) ? $k : $current_key, $log, $element_id );
+				// A safe key protects its whole subtree, so don't descend into it.
+				if ( self::is_px_safe_key( $k ) ) {
+					continue;
+				}
+				$path        = is_string( $k ) ? ( '' === $current_key ? $k : $current_key . '.' . $k ) : $current_key;
+				$value[ $k ] = self::strip_px_values( $v, $path, $log, $element_id );
 			}
 			return $value;
 		}
