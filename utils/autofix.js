@@ -8,7 +8,7 @@
  * Requires learnings to be passed in — autofix itself is pure (no API calls).
  */
 
-import { isValidBricksId } from './validator.js';
+import { isValidBricksId, isPxSafePath } from './validator.js';
 
 /**
  * Lenient ID check for autofix — accepts any lowercase alphanumeric string (3-12 chars).
@@ -28,33 +28,9 @@ function isAcceptableBricksId(id) {
   return true;
 }
 
-/**
- * Keys whose string values should never be stripped of "px".
- *
- * Matched against the whole settings path, not just the immediate key: `icon`
- * protects `icon.height` and `icon.width` exactly as it protects a bare `icon`
- * string. A key on this list marks a subtree the fixer has no business rewriting.
- */
-const PX_SAFE_KEYS = new Set([
-  'content', '_cssCustom', 'url', 'name', 'label', 'tag',
-  'link', 'href', 'src', 'alt', 'placeholder', 'icon', 'class',
-  'text', 'title', 'description',
-]);
-
-/**
- * True when any segment of the settings path is px-safe.
- *
- * The walker used to test only the immediate key, so for
- * `settings.icon = { height: "20px" }` the allowlist was tested against `height`
- * and never matched — `icon` was on the list but only ever protected a bare
- * `icon` string. Nothing nested was protected, on any save.
- */
-function isPxSafePath(path) {
-  for (const segment of path) {
-    if (PX_SAFE_KEYS.has(segment)) return true;
-  }
-  return false;
-}
+// PX_SAFE_KEYS and isPxSafePath live in validator.js so the fixer and the validator
+// can never disagree about which values are px-safe. If they did, autofix would
+// keep a value that validateContent() then rejects.
 
 /**
  * Flex-related settings that indicate a block should be a container.
@@ -373,16 +349,16 @@ function autofix(content, options = {}) {
   }
 
   // === Pass 1: Strip bare px values ===
-  // Skipped on 'preserve' — Floodway divergence from upstream v1.2.4 (2026-07-31).
-  // PX_SAFE_KEYS does not cover nested keys like icon.height, so a preserve save of
-  // human-authored content rewrote "20px" → "20". Bricks itself writes "20px" there
-  // (every icon in the Header Test template stores it that way), so the strip is a
-  // deviation, not a fix. Generated content still gets normalized.
-  if (mode === 'normalize') {
-    for (const el of content) {
-      if (el && el.settings && typeof el.settings === 'object') {
-        el.settings = stripPxValues(el.settings, '', log, el.id || '?');
-      }
+  // Runs in BOTH modes. It was briefly skipped on 'preserve' (2026-07-31) because the
+  // allowlist only matched the immediate key, so icon.height "20px" was rewritten.
+  // The allowlist is now matched against the whole settings path (isPxSafePath), so
+  // that reason is gone — and skipping it had a worse cost: a preserve save handed
+  // site-authored values like _margin.top "0px" straight to validateContent(), which
+  // rejects bare px, so a template read with bricks_get_template could not be written
+  // back unmodified (floodway-inbox#291). Every strip is reported in the fix log.
+  for (const el of content) {
+    if (el && el.settings && typeof el.settings === 'object') {
+      el.settings = stripPxValues(el.settings, '', log, el.id || '?');
     }
   }
 

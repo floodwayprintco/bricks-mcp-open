@@ -298,6 +298,12 @@ class Bricks_API_Bridge_Validator {
 
 		if ( is_array( $settings ) ) {
 			foreach ( $settings as $key => $value ) {
+				// Same px-safe subtrees the autofix leaves alone (icon.height "20px" is
+				// Bricks' own format). Without this the validator rejects what the
+				// autofix deliberately kept (floodway-inbox#291).
+				if ( Bricks_API_Bridge_Autofix::is_px_safe_key( $key ) ) {
+					continue;
+				}
 				$current_path = $path ? $path . '.' . $key : $key;
 				$sub_errors   = $this->check_no_px_values( $value, $current_path );
 				$errors       = array_merge( $errors, $sub_errors );

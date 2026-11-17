@@ -219,7 +219,9 @@ const templateTools = [
         if (body.bricks_data) parts.push(`Elements: ${body.bricks_data.length}`);
         if (title) parts.push(`Title: ${title}`);
         if (conditions) parts.push(`Conditions: ${JSON.stringify(conditions)}`);
-        if (fixResult && fixResult.log && fixResult.log.length > 0) parts.push(`Auto-fixed ${fixResult.log.length} issue(s)`);
+        // List each fix, not just a count: on a preserve save these are changes to
+        // existing content (e.g. _margin.top "0px" → "0"), so the caller should see them.
+        if (fixResult && fixResult.log && fixResult.log.length > 0) parts.push(`Auto-fixed ${fixResult.log.length} issue(s):\n${fixResult.log.map(l => `  - ${l}`).join('\n')}`);
         if (validation && validation.warnings && validation.warnings.length > 0) parts.push(`\n⚠️ ${validation.warnings.length} warning(s):\n${validation.warnings.map(w => `  - ${w}`).join('\n')}`);
         if (validation && validation.info && validation.info.length > 0) parts.push(`ℹ️ ${validation.info.length} hint(s):\n${validation.info.map(i => `  - ${i}`).join('\n')}`);
         return { content: [{ type: 'text', text: parts.join('\n') }] };
