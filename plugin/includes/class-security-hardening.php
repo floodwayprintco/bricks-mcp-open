@@ -250,12 +250,24 @@ class Bricks_API_Bridge_Security_Hardening {
 	/**
 	 * Strip version query strings from enqueued assets.
 	 *
+	 * Assets under a kept path retain their version, because for them the
+	 * query string is the cache-buster: with a long max-age, stripping it pins
+	 * a returning visitor to whatever copy they fetched first, for up to a
+	 * year after a release changes the file. Filter
+	 * `bricks_api_bridge_keep_version_paths` to change the list.
+	 *
 	 * @param string $src The asset URL.
 	 * @return string
 	 */
 	public function strip_version_query( $src ) {
 		if ( is_admin() ) {
 			return $src;
+		}
+		$keep_paths = apply_filters( 'bricks_api_bridge_keep_version_paths', array( '/plugins/floodway-customizer/' ) );
+		foreach ( (array) $keep_paths as $path ) {
+			if ( is_string( $path ) && '' !== $path && false !== strpos( $src, $path ) ) {
+				return $src;
+			}
 		}
 		if ( strpos( $src, '?ver=' ) !== false ) {
 			$src = remove_query_arg( 'ver', $src );
