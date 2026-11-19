@@ -597,9 +597,23 @@ add_action( 'rest_api_init', 'bricks_api_bridge_register_set_meta' );
  * Bricks may not replace %root% with the actual element selector for
  * data written via the REST API. This hook reads _cssCustom from each
  * element and outputs a <style> block with proper #brxe-{id} selectors.
+ *
+ * It re-emits the _cssCustom of every published template on every page, so
+ * once stored CSS uses literal #brxe-{id} selectors it only duplicates what
+ * Bricks already prints. Sites in that state can turn it off with the
+ * bab_compile_custom_css option (default on) or this filter.
  */
 function bricks_api_bridge_compile_custom_css() {
 	if ( is_admin() || ( defined( 'REST_REQUEST' ) && REST_REQUEST ) ) {
+		return;
+	}
+
+	/**
+	 * Filter whether the bridge emits its compiled custom CSS block.
+	 *
+	 * @param bool $enabled Defaults to the bab_compile_custom_css option (true).
+	 */
+	if ( ! apply_filters( 'bricks_api_bridge_compile_custom_css', (bool) get_option( 'bab_compile_custom_css', true ) ) ) {
 		return;
 	}
 
